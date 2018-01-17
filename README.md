@@ -7,18 +7,13 @@ It takes video or audio (of type "application/x-cenc")
 from qtdemux and performs the AES-CTR decryption and outputs the decrypted
 content on a source pad.
 
+This version handle widevine test encrypted contents.See https://www.bento4.com/developers/dash/encryption-and-drm/ widevine section.
+
 Requirements
 ------------
 *    gstreamer 1.6
-*    Openssl >=1.0.0h
+*    libwidevinecwrapperlib (sources are private for now).
 
 Usage
 -----
-The decryptor does not implement a real DRM system. It performs a sha1
-hash of the KID, converts that to a hex string and then looks for a file
-/tmp/\<hash string\>.key that contains the binary data of the key.
-
-    ./store-key.py 00000000000000000000000000000000 0123456789ABCDEF0123456789ABCDEF
-    ./store-key.py 0bbc0bbc0bbc0bbc0bbc0bbc0bbc1bbc ABCDEF0123456789ABCDEF0123456789
-    gst-launch-1.0 playbin uri='http://test-media.youview.co.uk/ondemand/bbb/avc3/1/2drm_manifest.mpd'
-
+The decryptor implements the interface to the widevine DRM interfacing the widevine DRM library.
