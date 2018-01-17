@@ -25,33 +25,39 @@
  *
  */
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
 
 #include <string.h>
 #include <stdio.h>
 
 #include <gst/gst.h>
-#include <gst/gstelement.h>
 #include <gst/base/gstbasetransform.h>
 #include <gst/base/gstbytereader.h>
 #include <gst/gstprotection.h>
-#include <gst/gstaesctr.h>
 
-#include <glib.h>
-
-#include <openssl/sha.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
+#include <libxml/xpath.h>
+#include <gst/gstmemory.h>
+
+
+#include "widevinecapi.h"
 
 #include "gstcencdec.h"
+#include "../deps/b64/b64.h"
+
 
 GST_DEBUG_CATEGORY_STATIC (gst_cenc_decrypt_debug_category);
 #define GST_CAT_DEFAULT gst_cenc_decrypt_debug_category
 
 #define KID_LENGTH 16
 #define KEY_LENGTH 16
+
+typedef struct _GstCencWidevinePSSH
+{
+    const gchar *systemId;
+    GstBuffer *privateData;
+} GstCencWidevinePSSH;
+
 
 typedef struct _GstCencKeyPair 
 {
@@ -62,14 +68,18 @@ typedef struct _GstCencKeyPair
 
 struct _GstCencDecrypt
 {
-  GstBaseTransform parent;
-  GPtrArray *keys; /* array of GstCencKeyPair objects */
+    GstBaseTransform parent;
+    GPtrArray *keys; /* array of GstCencKeyPair objects */
+    GstCencWidevinePSSH pssh;
+    gchar* licenseresponse;
 };
 
 struct _GstCencDecryptClass
 {
   GstBaseTransformClass parent_class;
 };
+
+static c_widevine_capi *widevine;
 
 /* prototypes */
 static void gst_cenc_decrypt_dispose (GObject * object);
@@ -83,9 +93,7 @@ static GstCaps *gst_cenc_decrypt_transform_caps (GstBaseTransform * base,
 
 static GstFlowReturn gst_cenc_decrypt_transform_ip (GstBaseTransform * trans,
     GstBuffer * buf);
-static const GstCencKeyPair* gst_cenc_decrypt_lookup_key (GstCencDecrypt * self,
-    GstBuffer * kid);
-static GstCencKeyPair* gst_cenc_decrypt_get_key (GstCencDecrypt * self, GstBuffer * kid);
+
 static gboolean gst_cenc_decrypt_sink_event_handler (GstBaseTransform * trans,
     GstEvent * event);
 static gchar* gst_cenc_create_uuid_string (gconstpointer uuid_bytes);
@@ -97,6 +105,7 @@ enum
 
 #define M_MPD_PROTECTION_ID "5e629af5-38da-4063-8977-97ffbd9902d4"
 #define M_PSSH_PROTECTION_ID "69f908af-4816-46ea-910c-cd5dcccb0a3a"
+#define M_WIDEVINE_PROTECTION_ID "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
 
 /* pad templates */
 
@@ -106,8 +115,9 @@ static GstStaticPadTemplate gst_cenc_decrypt_sink_template =
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS
     (
-     "application/x-cenc, protection-system=(string)" M_MPD_PROTECTION_ID "; "
-     "application/x-cenc, protection-system=(string)" M_PSSH_PROTECTION_ID)
+     //"application/x-cenc, protection-system=(string)" M_MPD_PROTECTION_ID "; "
+     //"application/x-cenc, protection-system=(string)" M_PSSH_PROTECTION_ID "; "
+     "application/x-cenc, protection-system=(string)" M_WIDEVINE_PROTECTION_ID)
     );
 
 static GstStaticPadTemplate gst_cenc_decrypt_src_template =
@@ -121,6 +131,7 @@ static GstStaticPadTemplate gst_cenc_decrypt_src_template =
 static const gchar* gst_cenc_decrypt_protection_ids[] = {
   M_MPD_PROTECTION_ID,
   M_PSSH_PROTECTION_ID,
+  M_WIDEVINE_PROTECTION_ID,
   NULL
 };
 
@@ -130,6 +141,14 @@ static const gchar* gst_cenc_decrypt_protection_ids[] = {
 G_DEFINE_TYPE (GstCencDecrypt, gst_cenc_decrypt, GST_TYPE_BASE_TRANSFORM);
 
 static void gst_cenc_keypair_destroy (gpointer data);
+
+static void gst_cenc_decrypt_save_pssh_box(GstCencDecrypt *pDecrypt, const gchar *systemId, GstBuffer *psshi);
+
+static void gst_cenc_dump_buffer(GstBuffer *pBuffer);
+
+static void gst_cenc_parse_video_data(GstCencDecrypt *self, const GstStructure *in);
+
+static const gchar *gst_cenc_encode_pssh(GstBuffer *pBuffer);
 
 static void
 gst_cenc_decrypt_class_init (GstCencDecryptClass * klass)
@@ -151,7 +170,7 @@ gst_cenc_decrypt_class_init (GstCencDecryptClass * klass)
       "Alex Ashley <alex.ashley@youview.com>");
 
   GST_DEBUG_CATEGORY_INIT (gst_cenc_decrypt_debug_category,
-      "cencdec", 0, "CENC decryptor");
+      "cencwidevinedec", 0, "CENC widevine decryptor");
 
   gobject_class->dispose = gst_cenc_decrypt_dispose;
   gobject_class->finalize = gst_cenc_decrypt_finalize;
@@ -164,6 +183,13 @@ gst_cenc_decrypt_class_init (GstCencDecryptClass * klass)
   base_transform_class->sink_event =
       GST_DEBUG_FUNCPTR (gst_cenc_decrypt_sink_event_handler);
   base_transform_class->transform_ip_on_passthrough = FALSE;
+
+    if (widevine == NULL) {
+        widevine = widevine_capi_allocate();
+        widevine_capi_initialize_remote_cdm(widevine, "/var/lib/widevine/libwidevinecdm_orig.dylib");
+    }
+
+  GST_DEBUG("CENC Init done");
 }
 
 static void
@@ -177,6 +203,7 @@ gst_cenc_decrypt_init (GstCencDecrypt * self)
   gst_base_transform_set_passthrough (base, FALSE);
   gst_base_transform_set_gap_aware (GST_BASE_TRANSFORM (self), FALSE);
   self->keys = g_ptr_array_new_with_free_func (gst_cenc_keypair_destroy);
+
 }
 
 void
@@ -282,6 +309,8 @@ gst_cenc_decrypt_transform_caps (GstBaseTransform * base,
   GstCaps *res = NULL;
   gint i, j;
 
+    GstCencDecrypt *self = GST_CENC_DECRYPT (base);
+
   g_return_val_if_fail (direction != GST_PAD_UNKNOWN, NULL);
 
   GST_DEBUG_OBJECT (base, "direction: %s   caps: %" GST_PTR_FORMAT "   filter:"
@@ -323,6 +352,7 @@ gst_cenc_decrypt_transform_caps (GstBaseTransform * base,
           }
       }
       gst_cenc_decrypt_append_if_not_duplicate(res, out);
+      //gst_cenc_parse_video_data(self, in);
     } else {                    /* GST_PAD_SRC */
       gint n_fields;
       GstStructure *tmp = NULL;
@@ -428,62 +458,7 @@ gst_cenc_decrypt_key_id_from_content_id(GstCencDecrypt * self, const gchar *cont
   return kid;
 }
 
-static GstCencKeyPair *
-gst_cenc_decrypt_get_key (GstCencDecrypt * self, GstBuffer * key_id)
-{
-  guint8 key[KEY_LENGTH] = { 0 };
-  guint8 hash[SHA_DIGEST_LENGTH] = { 0 };
-  gchar *hash_string;
-  gchar *path;
-  size_t bytes_read = 0;
-  FILE *key_file = NULL;
-  GstMapInfo info;
-  GstCencKeyPair *kp;
 
-  if(!gst_buffer_map(key_id, &info, GST_MAP_READ))
-    return NULL;
-  kp = g_new0 (GstCencKeyPair, 1);
-  kp->key_id = g_bytes_new (info.data, KEY_LENGTH);
-  kp->content_id = gst_cenc_create_content_id (info.data);
-  gst_buffer_unmap(key_id, &info);
-
-  GST_DEBUG_OBJECT (self, "Content ID: %s", kp->content_id);
-
-  /* Perform sha1 hash of content id. */
-  SHA1 ((const unsigned char *) kp->content_id, 47, hash);
-  hash_string = gst_cenc_bytes_to_string (hash, SHA_DIGEST_LENGTH);
-  GST_DEBUG_OBJECT (self, "Hash: %s", hash_string);
-  /*  g_free (content_id);*/
-
-  /* Read contents of file with the hash as its name. */
-  path = g_strconcat ("/tmp/", hash_string, ".key", NULL);
-  g_free (hash_string);
-  GST_DEBUG_OBJECT (self, "Opening file: %s", path);
-  key_file = fopen (path, "rb");
-
-  if (!key_file) {
-    GST_ERROR_OBJECT (self, "Failed to open keyfile: %s", path);
-    goto error;
-  }
-
-  bytes_read = fread (key, 1, KEY_LENGTH, key_file);
-  fclose (key_file);
-
-  if (bytes_read != KEY_LENGTH) {
-    GST_ERROR_OBJECT (self, "Failed to read key from file %s", path);
-    goto error;
-  }
-  g_free (path);
-
-  kp->key = g_bytes_new (key, KEY_LENGTH);
-  g_ptr_array_add (self->keys, kp);
-
-  return kp;
-error:
-  g_free (path);
-  gst_cenc_keypair_destroy (kp);
-  return NULL;
-}
 
 static gchar *
 gst_cenc_create_uuid_string (gconstpointer uuid_bytes)
@@ -503,36 +478,7 @@ gst_cenc_create_uuid_string (gconstpointer uuid_bytes)
   return uuid_string;
 }
 
-static const GstCencKeyPair*
-gst_cenc_decrypt_lookup_key (GstCencDecrypt * self, GstBuffer * kid)
-{
-  GstMapInfo info;
-  const GstCencKeyPair *kp=NULL;
-  int i;
-  gsize sz;
 
-  /*
-    GstMapInfo info;
-    gchar *id_string;
-    gst_buffer_map (kid, &info, GST_MAP_READ);
-    id_string = gst_cenc_create_uuid_string (info.data);
-    GST_DEBUG_OBJECT (self, "Looking up key ID: %s", id_string);
-    g_free (id_string);
-    gst_buffer_unmap (kid, &info);
-  */
-  for (i = 0; kp==NULL && i < self->keys->len; ++i) {
-    const GstCencKeyPair *k;
-    k = g_ptr_array_index (self->keys, i);
-    if(gst_buffer_memcmp (kid, 0, g_bytes_get_data (k->key_id, NULL), KEY_LENGTH)==0){
-      kp=k;
-    }
-  }
-  if (!kp) {
-    kp = gst_cenc_decrypt_get_key (self, kid);
-  }
-
-  return kp;
-}
 
 static GstFlowReturn
 gst_cenc_decrypt_transform_ip (GstBaseTransform * base, GstBuffer * buf)
@@ -545,12 +491,16 @@ gst_cenc_decrypt_transform_ip (GstBaseTransform * base, GstBuffer * buf)
   guint pos = 0;
   gint sample_index = 0;
   guint subsample_count;
-  AesCtrState *state = NULL;
+
   guint iv_size;
   gboolean encrypted;
   const GValue *value;
   GstBuffer *key_id = NULL;
   GstBuffer *iv_buf = NULL;
+
+  uint8_t key_id_scan[16];
+  uint8_t iv_scan[16];
+
   GBytes *iv_bytes = NULL;
   GstBuffer *subsamples_buf = NULL;
   GstMapInfo subsamples_map;
@@ -604,6 +554,13 @@ gst_cenc_decrypt_transform_ip (GstBaseTransform * base, GstBuffer * buf)
   }
   key_id = gst_value_get_buffer (value);
 
+  GstMapInfo key_id_map;
+  if(!gst_buffer_map (key_id, &key_id_map, GST_MAP_READ)){
+    GST_ERROR_OBJECT (self, "Failed to map Key ID");
+    ret = GST_FLOW_NOT_SUPPORTED;
+    goto release;
+  }
+  
   value = gst_structure_get_value (prot_meta->info, "iv");
   if(!value){
     GST_ERROR_OBJECT (self, "Failed to get IV for sample");
@@ -632,26 +589,20 @@ gst_cenc_decrypt_transform_ip (GstBaseTransform * base, GstBuffer * buf)
       goto release;
     }
   }
+/*
+    for (int i = 0 ; i < 16 ; i++) {
+        unsigned int data;
+        sscanf((const char *) &(key_id_map.data[i * 2]), "%c", &data);
+        key_id_scan[i] = (uint8_t) data;
+    }
+    for (int i = 0 ; i < 16 ; i++) {
+        unsigned int data;
+        sscanf((const char *) &(iv_map.data[i * 2]), "%c", &data);
+        iv_scan[i] = (uint8_t) data;
+    }
+*/
 
-  keypair = gst_cenc_decrypt_lookup_key (self,key_id);
-
-  if (!keypair) {
-    gsize sz;
-    GST_ERROR_OBJECT (self, "Failed to lookup key");
-    GST_MEMDUMP_OBJECT (self, "Key ID:", 
-                        g_bytes_get_data (keypair->key_id, &sz),
-                        sz);
-    ret = GST_FLOW_NOT_SUPPORTED;
-    goto release;
-  }
-
-  state = gst_aes_ctr_decrypt_new (keypair->key, iv_bytes);
-
-  if (!state) {
-    GST_ERROR_OBJECT (self, "Failed to init AES cipher");
-    ret = GST_FLOW_NOT_SUPPORTED;
-    goto release;
-  }
+  gst_cenc_dump_buffer(key_id);
 
   reader = gst_byte_reader_new (subsamples_map.data, subsamples_map.size);
   if(!reader){
@@ -681,16 +632,18 @@ gst_cenc_decrypt_transform_ip (GstBaseTransform * base, GstBuffer * buf)
     if (n_bytes_encrypted) {
       GST_TRACE_OBJECT (self, "%u bytes encrypted (todo=%d)",
                         n_bytes_encrypted, (gint)map.size - pos);
-      gst_aes_ctr_decrypt_ip (state, map.data + pos, n_bytes_encrypted);
+
+      widevine_capi_rawdecrypt(widevine, map.data + pos, n_bytes_encrypted,
+                               key_id_map.data,
+                               iv_map.data);
+        
       pos += n_bytes_encrypted;
     }
   }
 
 beach:
   gst_buffer_unmap (buf, &map);
-  if (state) {
-    gst_aes_ctr_decrypt_unref (state);
-  }
+
 release:
   if (reader){
     gst_byte_reader_free (reader);
@@ -716,6 +669,8 @@ gst_cenc_decrypt_parse_pssh_box (GstCencDecrypt * self, GstBuffer * pssh)
   guint8 version;
   guint32 data_size;
 
+  GST_DEBUG("Parsing SSH BOX");
+  
   gst_buffer_map (pssh, &info, GST_MAP_READ);
   gst_byte_reader_init (&br, info.data, info.size);
 
@@ -772,14 +727,14 @@ gst_cenc_decrypt_parse_content_protection_element (GstCencDecrypt * self,
 
   gst_buffer_map (pssi, &info, GST_MAP_READ);
 
-  /* this initialize the library and check potential ABI mismatches
-   * between the version it was compiled for and the actual shared
-   * library used
-   */
+    /* this initialize the library and check potential ABI mismatches
+     * between the version it was compiled for and the actual shared
+     * library used
+     */
   LIBXML_TEST_VERSION
   /* parse "data" into a document (which is a libxml2 tree structure xmlDoc) */
   doc =
-    xmlReadMemory (info.data, info.size, "ContentProtection.xml", NULL, XML_PARSE_NONET);
+    xmlReadMemory ((const char *) info.data, (int) info.size, "ContentProtection.xml", NULL, XML_PARSE_NONET);
   if (!doc) {
     ret = FALSE;
     GST_ERROR_OBJECT (self, "Failed to parse XML from pssi event");
@@ -811,16 +766,23 @@ gst_cenc_decrypt_parse_content_protection_element (GstCencDecrypt * self,
       if (!node_content)
         continue;
       GST_DEBUG_OBJECT (self, "ContentId: %s", node_content);
-      kid = gst_cenc_decrypt_key_id_from_content_id(self, node_content);
+      kid = gst_cenc_decrypt_key_id_from_content_id(self, (const gchar *) node_content);
       /* pre-fetch the key */
-      if(kid && !gst_cenc_decrypt_get_key (self, kid)){
-        GST_ERROR_OBJECT (self, "Failed to get key for content ID %s", node_content);
-      }
       if(kid)
         gst_buffer_unref (kid);
       xmlFree (node_content);
     }
   }
+    /* Parse audio / video + pssh */
+
+    //xmlXPathContextPtr xpathCtx = xmlXPathNewContext(doc);
+
+    //xmlXPathObjectPtr  xpathObj = xmlXPathEvalExpression((const xmlChar *) "/MPD/Period/AdaptationSet", xpathCtx);
+    //if(xpathObj == NULL) {
+    //    xmlXPathFreeContext(xpathCtx);
+    //    GST_ERROR("XML PATH not found")
+    //}
+
 
 beach:
   gst_buffer_unmap (pssi, &info);
@@ -833,7 +795,9 @@ static gboolean
 gst_cenc_decrypt_sink_event_handler (GstBaseTransform * trans, GstEvent * event)
 {
   gboolean ret = TRUE;
+  static gboolean is_running = 0;
   const gchar *system_id;
+
   GstBuffer *pssi = NULL;
   const gchar *loc;
   GstCencDecrypt *self = GST_CENC_DECRYPT (trans);
@@ -841,15 +805,35 @@ gst_cenc_decrypt_sink_event_handler (GstBaseTransform * trans, GstEvent * event)
   switch (GST_EVENT_TYPE (event)) {
     case GST_EVENT_PROTECTION:
         GST_DEBUG_OBJECT (self, "received protection event");
+
         gst_event_parse_protection (event, &system_id, &pssi, &loc);
+        gst_cenc_dump_buffer(pssi);
+
         GST_DEBUG_OBJECT (self, "system_id: %s  loc: %s", system_id, loc);
         if(g_ascii_strcasecmp(loc, "dash/mpd")==0 && g_ascii_strcasecmp(system_id, M_MPD_PROTECTION_ID)==0){
             GST_DEBUG_OBJECT (self, "event carries MPD pssi data");
             gst_cenc_decrypt_parse_content_protection_element (self, pssi);
-        }
-        else if(g_str_has_prefix (loc, "isobmff/") && g_ascii_strcasecmp(system_id, M_PSSH_PROTECTION_ID)==0){
+        } else if(g_str_has_prefix (loc, "isobmff/") && g_ascii_strcasecmp(system_id, M_PSSH_PROTECTION_ID)==0){
           GST_DEBUG_OBJECT (self, "event carries pssh data from qtdemux");
           gst_cenc_decrypt_parse_pssh_box (self, pssi);
+        } else if(g_str_has_prefix (loc, "isobmff/") && g_ascii_strcasecmp(system_id, M_WIDEVINE_PROTECTION_ID)==0){
+            GST_DEBUG_OBJECT (self, "event carries pssh data for widevine");
+            gst_cenc_decrypt_parse_pssh_box (self, pssi);
+            gst_cenc_decrypt_save_pssh_box(self, system_id, pssi);
+
+
+            GstMapInfo info;
+            gst_buffer_map(self->pssh.privateData, &info, GST_MAP_READ);
+            size_t len = 0;
+            char* encoded = base64_encode(info.data, info.size, &len);
+            if(self->licenseresponse == NULL && is_running == 0) {
+              is_running = 1;
+              self->licenseresponse = (gchar *) widevine_capi_create_session(widevine, "widevine_test", encoded);
+              is_running = 0;
+            }
+
+            //free(encoded);
+
         }
         gst_event_unref (event);
       break;
@@ -862,6 +846,34 @@ gst_cenc_decrypt_sink_event_handler (GstBaseTransform * trans, GstEvent * event)
   return ret;
 }
 
+
+
+static void gst_cenc_dump_buffer(GstBuffer *pBuffer) {
+
+    GstMapInfo info;
+
+    GST_DEBUG("DUMP:");
+
+    gst_buffer_map (pBuffer, &info, GST_MAP_READ);
+    for (long i = 0 ; i < info.size; i++) {
+        printf("%c", info.data[i]);
+    }
+    printf("\n");
+
+
+}
+
+static void gst_cenc_decrypt_save_pssh_box(GstCencDecrypt *pDecrypt, const gchar *systemId, GstBuffer *psshi) {
+
+    GST_DEBUG("Saving PSSH Box");
+
+    gsize size;
+
+    pDecrypt->pssh.systemId = systemId;
+    pDecrypt->pssh.privateData = psshi;
+
+}
+
 static void gst_cenc_keypair_destroy (gpointer data)
 {
   GstCencKeyPair *key_pair = (GstCencKeyPair*)data;
@@ -870,4 +882,7 @@ static void gst_cenc_keypair_destroy (gpointer data)
   g_bytes_unref (key_pair->key);
   g_free (key_pair);
 }
+
+
+
 

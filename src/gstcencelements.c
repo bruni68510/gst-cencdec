@@ -18,25 +18,30 @@
  */
 
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
+#define PACKAGE "CENCWIDEVINECENC"
+#include <printf.h>
 #include "gstcencdec.h"
+
+#define VERSION "0.0.1"
+
+#define PACKAGE_NAME "The widevinecenc decryptor"
 
 static gboolean
 plugin_init (GstPlugin * plugin)
 {
-  return gst_element_register (plugin, "cencdec", GST_RANK_PRIMARY,
+    
+  printf("Registering cencdec plugin\n");
+  
+  return gst_element_register (plugin, "cencwidevinedec", GST_RANK_PRIMARY,
       GST_TYPE_CENC_DECRYPT);
 }
 
 GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
     GST_VERSION_MINOR,
-    cencdec,
+    cencwidevinedec,
     "ISOBMFF common encryption element",
     plugin_init,
     VERSION,
     "LGPL",
     PACKAGE_NAME,
-    "https://github.com/asrashley/gst-cencdec.git");
+    "https://github.com/bruni68510/gst-cencwidevinedec.git");
